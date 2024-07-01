@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/restic/restic/internal/errors"
-	"github.com/restic/restic/internal/index"
+	"github.com/restic/restic/internal/repository/index"
 	"github.com/restic/restic/internal/restic"
 
 	"github.com/spf13/cobra"
@@ -59,10 +59,9 @@ func runList(ctx context.Context, gopts GlobalOptions, args []string) error {
 			if err != nil {
 				return err
 			}
-			idx.Each(ctx, func(blobs restic.PackedBlob) {
+			return idx.Each(ctx, func(blobs restic.PackedBlob) {
 				Printf("%v %v\n", blobs.Type, blobs.ID)
 			})
-			return nil
 		})
 	default:
 		return errors.Fatal("invalid type")

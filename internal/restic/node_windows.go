@@ -23,6 +23,9 @@ type WindowsAttributes struct {
 	CreationTime *syscall.Filetime `generic:"creation_time"`
 	// FileAttributes is used for storing file attributes for windows files.
 	FileAttributes *uint32 `generic:"file_attributes"`
+	// SecurityDescriptor is used for storing security descriptors which includes
+	// owner, group, discretionary access control list (DACL), system access control list (SACL)
+	SecurityDescriptor *[]byte `generic:"security_descriptor"`
 }
 
 var (
@@ -32,12 +35,12 @@ var (
 )
 
 // mknod is not supported on Windows.
-func mknod(_ string, mode uint32, dev uint64) (err error) {
+func mknod(_ string, _ uint32, _ uint64) (err error) {
 	return errors.New("device nodes cannot be created on windows")
 }
 
 // Windows doesn't need lchown
-func lchown(_ string, uid int, gid int) (err error) {
+func lchown(_ string, _ int, _ int) (err error) {
 	return nil
 }
 
@@ -67,19 +70,97 @@ func (node Node) restoreSymlinkTimestamps(path string, utimes [2]syscall.Timespe
 	return syscall.SetFileTime(h, nil, &a, &w)
 }
 
-// Getxattr retrieves extended attribute data associated with path.
-func Getxattr(path, name string) ([]byte, error) {
-	return nil, nil
+// restore extended attributes for windows
+func (node Node) restoreExtendedAttributes(path string) (err error) {
+	count := len(node.ExtendedAttributes)
+	if count > 0 {
+		eas := make([]fs.ExtendedAttribute, count)
+		for i, attr := range node.ExtendedAttributes {
+			eas[i] = fs.ExtendedAttribute{Name: attr.Name, Value: attr.Value}
+		}
+		if errExt := restoreExtendedAttributes(node.Type, path, eas); errExt != nil {
+			return errExt
+		}
+	}
+	return nil
 }
 
-// Listxattr retrieves a list of names of extended attributes associated with the
-// given path in the file system.
-func Listxattr(path string) ([]string, error) {
-	return nil, nil
+// fill extended attributes in the node. This also includes the Generic attributes for windows.
+func (node *Node) fillExtendedAttributes(path string, _ bool) (err error) {
+	var fileHandle windows.Handle
+	if fileHandle, err = fs.OpenHandleForEA(node.Type, path, false); fileHandle == 0 {
+		return nil
+	}
+	if err != nil {
+		return errors.Errorf("get EA failed while opening file handle for path %v, with: %v", path, err)
+	}
+	defer closeFileHandle(fileHandle, path) // Replaced inline defer with named function call
+	//Get the windows Extended Attributes using the file handle
+	var extAtts []fs.ExtendedAttribute
+	extAtts, err = fs.GetFileEA(fileHandle)
+	debug.Log("fillExtendedAttributes(%v) %v", path, extAtts)
+	if err != nil {
+		return errors.Errorf("get EA failed for path %v, with: %v", path, err)
+	}
+	if len(extAtts) == 0 {
+		return nil
+	}
+
+	//Fill the ExtendedAttributes in the node using the name/value pairs in the windows EA
+	for _, attr := range extAtts {
+		extendedAttr := ExtendedAttribute{
+			Name:  attr.Name,
+			Value: attr.Value,
+		}
+
+		node.ExtendedAttributes = append(node.ExtendedAttributes, extendedAttr)
+	}
+	return nil
 }
 
-// Setxattr associates name and data together as an attribute of path.
-func Setxattr(path, name string, data []byte) error {
+// closeFileHandle safely closes a file handle and logs any errors.
+func closeFileHandle(fileHandle windows.Handle, path string) {
+	err := windows.CloseHandle(fileHandle)
+	if err != nil {
+		debug.Log("Error closing file handle for %s: %v\n", path, err)
+	}
+}
+
+// restoreExtendedAttributes handles restore of the Windows Extended Attributes to the specified path.
+// The Windows API requires setting of all the Extended Attributes in one call.
+func restoreExtendedAttributes(nodeType, path string, eas []fs.ExtendedAttribute) (err error) {
+	var fileHandle windows.Handle
+	if fileHandle, err = fs.OpenHandleForEA(nodeType, path, true); fileHandle == 0 {
+		return nil
+	}
+	if err != nil {
+		return errors.Errorf("set EA failed while opening file handle for path %v, with: %v", path, err)
+	}
+	defer closeFileHandle(fileHandle, path) // Replaced inline defer with named function call
+
+	// clear old unexpected xattrs by setting them to an empty value
+	oldEAs, err := fs.GetFileEA(fileHandle)
+	if err != nil {
+		return err
+	}
+
+	for _, oldEA := range oldEAs {
+		found := false
+		for _, ea := range eas {
+			if strings.EqualFold(ea.Name, oldEA.Name) {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			eas = append(eas, fs.ExtendedAttribute{Name: oldEA.Name, Value: nil})
+		}
+	}
+
+	if err = fs.SetFileEA(fileHandle, eas); err != nil {
+		return errors.Errorf("set EA failed for path %v, with: %v", path, err)
+	}
 	return nil
 }
 
@@ -114,7 +195,7 @@ func (s statT) mtim() syscall.Timespec {
 
 func (s statT) ctim() syscall.Timespec {
 	// Windows does not have the concept of a "change time" in the sense Unix uses it, so we're using the LastWriteTime here.
-	return syscall.NsecToTimespec(s.LastWriteTime.Nanoseconds())
+	return s.mtim()
 }
 
 // restoreGenericAttributes restores generic attributes for Windows
@@ -135,6 +216,11 @@ func (node Node) restoreGenericAttributes(path string, warn func(msg string)) (e
 	if windowsAttributes.FileAttributes != nil {
 		if err := restoreFileAttributes(path, windowsAttributes.FileAttributes); err != nil {
 			errs = append(errs, fmt.Errorf("error restoring file attributes for: %s : %v", path, err))
+		}
+	}
+	if windowsAttributes.SecurityDescriptor != nil {
+		if err := fs.SetSecurityDescriptor(path, windowsAttributes.SecurityDescriptor); err != nil {
+			errs = append(errs, fmt.Errorf("error restoring security descriptor for: %s : %v", path, err))
 		}
 	}
 
@@ -192,17 +278,20 @@ func fixEncryptionAttribute(path string, attrs *uint32, pathPointer *uint16) (er
 		// File should be encrypted.
 		err = encryptFile(pathPointer)
 		if err != nil {
-			if fs.IsAccessDenied(err) {
+			if fs.IsAccessDenied(err) || errors.Is(err, windows.ERROR_FILE_READ_ONLY) {
 				// If existing file already has readonly or system flag, encrypt file call fails.
-				// We have already cleared readonly flag, clearing system flag if needed.
 				// The readonly and system flags will be set again at the end of this func if they are needed.
+				err = fs.ResetPermissions(path)
+				if err != nil {
+					return fmt.Errorf("failed to encrypt file: failed to reset permissions: %s : %v", path, err)
+				}
 				err = fs.ClearSystem(path)
 				if err != nil {
 					return fmt.Errorf("failed to encrypt file: failed to clear system flag: %s : %v", path, err)
 				}
 				err = encryptFile(pathPointer)
 				if err != nil {
-					return fmt.Errorf("failed to encrypt file: %s : %v", path, err)
+					return fmt.Errorf("failed retry to encrypt file: %s : %v", path, err)
 				}
 			} else {
 				return fmt.Errorf("failed to encrypt file: %s : %v", path, err)
@@ -217,17 +306,20 @@ func fixEncryptionAttribute(path string, attrs *uint32, pathPointer *uint16) (er
 			// File should not be encrypted, but its already encrypted. Decrypt it.
 			err = decryptFile(pathPointer)
 			if err != nil {
-				if fs.IsAccessDenied(err) {
+				if fs.IsAccessDenied(err) || errors.Is(err, windows.ERROR_FILE_READ_ONLY) {
 					// If existing file already has readonly or system flag, decrypt file call fails.
-					// We have already cleared readonly flag, clearing system flag if needed.
 					// The readonly and system flags will be set again after this func if they are needed.
+					err = fs.ResetPermissions(path)
+					if err != nil {
+						return fmt.Errorf("failed to encrypt file: failed to reset permissions: %s : %v", path, err)
+					}
 					err = fs.ClearSystem(path)
 					if err != nil {
 						return fmt.Errorf("failed to decrypt file: failed to clear system flag: %s : %v", path, err)
 					}
 					err = decryptFile(pathPointer)
 					if err != nil {
-						return fmt.Errorf("failed to decrypt file: %s : %v", path, err)
+						return fmt.Errorf("failed retry to decrypt file: %s : %v", path, err)
 					}
 				} else {
 					return fmt.Errorf("failed to decrypt file: %s : %v", path, err)
@@ -270,11 +362,18 @@ func (node *Node) fillGenericAttributes(path string, fi os.FileInfo, stat *statT
 		// Do not process file attributes and created time for windows directories like
 		// C:, D:
 		// Filepath.Clean(path) ends with '\' for Windows root drives only.
+		var sd *[]byte
+		if node.Type == "file" || node.Type == "dir" {
+			if sd, err = fs.GetSecurityDescriptor(path); err != nil {
+				return true, err
+			}
+		}
 
 		// Add Windows attributes
 		node.GenericAttributes, err = WindowsAttrsToGenericAttributes(WindowsAttributes{
-			CreationTime:   getCreationTime(fi, path),
-			FileAttributes: &stat.FileAttributes,
+			CreationTime:       getCreationTime(fi, path),
+			FileAttributes:     &stat.FileAttributes,
+			SecurityDescriptor: sd,
 		})
 	}
 	return true, err

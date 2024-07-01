@@ -439,7 +439,10 @@ func (f *Finder) packsToBlobs(ctx context.Context, packs []string) error {
 
 	if err != errAllPacksFound {
 		// try to resolve unknown pack ids from the index
-		packIDs = f.indexPacksToBlobs(ctx, packIDs)
+		packIDs, err = f.indexPacksToBlobs(ctx, packIDs)
+		if err != nil {
+			return err
+		}
 	}
 
 	if len(packIDs) > 0 {
@@ -456,13 +459,13 @@ func (f *Finder) packsToBlobs(ctx context.Context, packs []string) error {
 	return nil
 }
 
-func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struct{}) map[string]struct{} {
+func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struct{}) (map[string]struct{}, error) {
 	wctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// remember which packs were found in the index
 	indexPackIDs := make(map[string]struct{})
-	f.repo.Index().Each(wctx, func(pb restic.PackedBlob) {
+	err := f.repo.ListBlobs(wctx, func(pb restic.PackedBlob) {
 		idStr := pb.PackID.String()
 		// keep entry in packIDs as Each() returns individual index entries
 		matchingID := false
@@ -481,6 +484,9 @@ func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struc
 			indexPackIDs[idStr] = struct{}{}
 		}
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	for id := range indexPackIDs {
 		delete(packIDs, id)
@@ -493,19 +499,17 @@ func (f *Finder) indexPacksToBlobs(ctx context.Context, packIDs map[string]struc
 		}
 		Warnf("some pack files are missing from the repository, getting their blobs from the repository index: %v\n\n", list)
 	}
-	return packIDs
+	return packIDs, nil
 }
 
 func (f *Finder) findObjectPack(id string, t restic.BlobType) {
-	idx := f.repo.Index()
-
 	rid, err := restic.ParseID(id)
 	if err != nil {
 		Printf("Note: cannot find pack for object '%s', unable to parse ID: %v\n", id, err)
 		return
 	}
 
-	blobs := idx.Lookup(restic.BlobHandle{ID: rid, Type: t})
+	blobs := f.repo.LookupBlob(t, rid)
 	if len(blobs) == 0 {
 		Printf("Object %s not found in the index\n", rid.Str())
 		return
@@ -607,6 +611,9 @@ func runFind(ctx context.Context, opts FindOptions, gopts GlobalOptions, args []
 	var filteredSnapshots []*restic.Snapshot
 	for sn := range FindFilteredSnapshots(ctx, snapshotLister, repo, &opts.SnapshotFilter, opts.Snapshots) {
 		filteredSnapshots = append(filteredSnapshots, sn)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	sort.Slice(filteredSnapshots, func(i, j int) bool {

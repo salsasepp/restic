@@ -68,9 +68,17 @@ There are case insensitive variants of ``--exclude`` and ``--include`` called
 ``--iexclude`` and ``--iinclude``. These options will behave the same way but
 ignore the casing of paths.
 
+There are also ``--include-file``, ``--exclude-file``, ``--iinclude-file`` and
+ ``--iexclude-file`` flags that read the include and exclude patterns from a file.
+
 Restoring symbolic links on windows is only possible when the user has
 ``SeCreateSymbolicLinkPrivilege`` privilege or is running as admin. This is a
 restriction of windows not restic.
+
+Restoring full security descriptors on Windows is only possible when the user has
+``SeRestorePrivilege``, ``SeSecurityPrivilege`` and ``SeTakeOwnershipPrivilege`` 
+privilege or is running as admin. This is a restriction of Windows not restic.
+If either of these conditions are not met, only the DACL will be restored.
 
 By default, restic does not restore files as sparse. Use ``restore --sparse`` to
 enable the creation of sparse files if supported by the filesystem. Then restic
@@ -79,6 +87,30 @@ Reading from a hole returns the original zero bytes, but it does not consume
 disk space. Note that the exact location of the holes can differ from those in
 the original file, as their location is determined while restoring and is not
 stored explicitly.
+
+Restoring in-place
+------------------
+
+.. note::
+
+    Restoring data in-place can leave files in a partially restored state if the ``restore``
+    operation is interrupted. To ensure you can revert back to the previous state, create
+    a current ``backup`` before restoring a different snapshot.
+
+By default, the ``restore`` command overwrites already existing files at the target
+directory. This behavior can be configured via the ``--overwrite`` option. The following
+values are supported:
+
+* ``--overwrite always`` (default): always overwrites already existing files. ``restore``
+  will verify the existing file content and only restore mismatching parts to minimize
+  downloads. Updates the metadata of all files.
+* ``--overwrite if-changed``: like the previous case, but speeds up the file content check
+  by assuming that files with matching size and modification time (mtime) are already up to date.
+  In case of a mismatch, the full file content is verified. Updates the metadata of all files.
+* ``--overwrite if-newer``: only overwrite existing files if the file in the snapshot has a
+  newer modification time (mtime).
+* ``--overwrite never``: never overwrite existing files.
+
 
 Restore using mount
 ===================
@@ -98,9 +130,9 @@ command to serve the repository with FUSE:
 
 Mounting repositories via FUSE is only possible on Linux, macOS and FreeBSD.
 On Linux, the ``fuse`` kernel module needs to be loaded and the ``fusermount``
-command needs to be in the ``PATH``. On macOS, you need `FUSE for macOS
-<https://osxfuse.github.io/>`__. On FreeBSD, you may need to install FUSE
-and load the kernel module (``kldload fuse``).
+command needs to be in the ``PATH``. On macOS, you need `FUSE-T
+<https://www.fuse-t.org/>`__ or `FUSE for macOS <https://osxfuse.github.io/>`__.
+On FreeBSD, you may need to install FUSE and load the kernel module (``kldload fuse``).
 
 Restic supports storage and preservation of hard links. However, since
 hard links exist in the scope of a filesystem by definition, restoring
@@ -179,4 +211,5 @@ It is also possible to ``dump`` the contents of a selected snapshot and folder
 structure to a file using the ``--target`` flag.
 
 .. code-block:: console
+
     $ restic -r /srv/restic-repo dump latest / --target /home/linux.user/output.tar -a tar

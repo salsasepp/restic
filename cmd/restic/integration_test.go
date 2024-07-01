@@ -12,6 +12,7 @@ import (
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
+	"github.com/restic/restic/internal/ui/termstatus"
 )
 
 func TestCheckRestoreNoLock(t *testing.T) {
@@ -86,10 +87,15 @@ func TestListOnce(t *testing.T) {
 
 	createPrunableRepo(t, env)
 	testRunPrune(t, env.gopts, pruneOpts)
-	rtest.OK(t, runCheck(context.TODO(), checkOpts, env.gopts, nil))
-
-	rtest.OK(t, runRebuildIndex(context.TODO(), RepairIndexOptions{}, env.gopts))
-	rtest.OK(t, runRebuildIndex(context.TODO(), RepairIndexOptions{ReadAllPacks: true}, env.gopts))
+	rtest.OK(t, withTermStatus(env.gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+		return runCheck(context.TODO(), checkOpts, env.gopts, nil, term)
+	}))
+	rtest.OK(t, withTermStatus(env.gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+		return runRebuildIndex(context.TODO(), RepairIndexOptions{}, env.gopts, term)
+	}))
+	rtest.OK(t, withTermStatus(env.gopts, func(ctx context.Context, term *termstatus.Terminal) error {
+		return runRebuildIndex(context.TODO(), RepairIndexOptions{ReadAllPacks: true}, env.gopts, term)
+	}))
 }
 
 type writeToOnly struct {

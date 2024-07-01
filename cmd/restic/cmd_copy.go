@@ -53,7 +53,7 @@ func init() {
 }
 
 func runCopy(ctx context.Context, opts CopyOptions, gopts GlobalOptions, args []string) error {
-	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(opts.secondaryRepoOptions, gopts, "destination")
+	secondaryGopts, isFromRepo, err := fillSecondaryGlobalOpts(ctx, opts.secondaryRepoOptions, gopts, "destination")
 	if err != nil {
 		return err
 	}
@@ -103,6 +103,9 @@ func runCopy(ctx context.Context, opts CopyOptions, gopts GlobalOptions, args []
 		// also consider identical snapshot copies
 		dstSnapshotByOriginal[*sn.ID()] = append(dstSnapshotByOriginal[*sn.ID()], sn)
 	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	// remember already processed trees across all snapshots
 	visitedTrees := restic.NewIDSet()
@@ -147,7 +150,7 @@ func runCopy(ctx context.Context, opts CopyOptions, gopts GlobalOptions, args []
 		}
 		Verbosef("snapshot %s saved\n", newID.Str())
 	}
-	return nil
+	return ctx.Err()
 }
 
 func similarSnapshots(sna *restic.Snapshot, snb *restic.Snapshot) bool {
@@ -184,7 +187,7 @@ func copyTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Rep
 	packList := restic.NewIDSet()
 
 	enqueue := func(h restic.BlobHandle) {
-		pb := srcRepo.Index().Lookup(h)
+		pb := srcRepo.LookupBlob(h.Type, h.ID)
 		copyBlobs.Insert(h)
 		for _, p := range pb {
 			packList.Insert(p.PackID)
@@ -199,7 +202,7 @@ func copyTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Rep
 
 			// Do we already have this tree blob?
 			treeHandle := restic.BlobHandle{ID: tree.ID, Type: restic.TreeBlob}
-			if !dstRepo.Index().Has(treeHandle) {
+			if _, ok := dstRepo.LookupBlobSize(treeHandle.Type, treeHandle.ID); !ok {
 				// copy raw tree bytes to avoid problems if the serialization changes
 				enqueue(treeHandle)
 			}
@@ -209,7 +212,7 @@ func copyTree(ctx context.Context, srcRepo restic.Repository, dstRepo restic.Rep
 				// Copy the blobs for this file.
 				for _, blobID := range entry.Content {
 					h := restic.BlobHandle{Type: restic.DataBlob, ID: blobID}
-					if !dstRepo.Index().Has(h) {
+					if _, ok := dstRepo.LookupBlobSize(h.Type, h.ID); !ok {
 						enqueue(h)
 					}
 				}

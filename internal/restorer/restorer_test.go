@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,6 +35,11 @@ type File struct {
 	Mode       os.FileMode
 	ModTime    time.Time
 	attributes *FileAttributes
+}
+
+type Symlink struct {
+	Target  string
+	ModTime time.Time
 }
 
 type Dir struct {
@@ -100,6 +106,20 @@ func saveDir(t testing.TB, repo restic.BlobSaver, nodes map[string]Node, inode u
 				Inode:             fi,
 				Links:             lc,
 				GenericAttributes: getGenericAttributes(node.attributes, false),
+			})
+			rtest.OK(t, err)
+		case Symlink:
+			symlink := n.(Symlink)
+			err := tree.Insert(&restic.Node{
+				Type:       "symlink",
+				Mode:       os.ModeSymlink | 0o777,
+				ModTime:    symlink.ModTime,
+				Name:       name,
+				UID:        uint32(os.Getuid()),
+				GID:        uint32(os.Getgid()),
+				LinkTarget: symlink.Target,
+				Inode:      inode,
+				Links:      1,
 			})
 			rtest.OK(t, err)
 		case Dir:
@@ -343,7 +363,7 @@ func TestRestorer(t *testing.T) {
 			sn, id := saveSnapshot(t, repo, test.Snapshot, noopGetGenericAttributes)
 			t.Logf("snapshot saved as %v", id.Str())
 
-			res := NewRestorer(repo, sn, false, nil)
+			res := NewRestorer(repo, sn, Options{})
 
 			tempdir := rtest.TempDir(t)
 			// make sure we're creating a new subdir of the tempdir
@@ -460,7 +480,7 @@ func TestRestorerRelative(t *testing.T) {
 			sn, id := saveSnapshot(t, repo, test.Snapshot, noopGetGenericAttributes)
 			t.Logf("snapshot saved as %v", id.Str())
 
-			res := NewRestorer(repo, sn, false, nil)
+			res := NewRestorer(repo, sn, Options{})
 
 			tempdir := rtest.TempDir(t)
 			cleanup := rtest.Chdir(t, tempdir)
@@ -689,7 +709,7 @@ func TestRestorerTraverseTree(t *testing.T) {
 			repo := repository.TestRepository(t)
 			sn, _ := saveSnapshot(t, repo, test.Snapshot, noopGetGenericAttributes)
 
-			res := NewRestorer(repo, sn, false, nil)
+			res := NewRestorer(repo, sn, Options{})
 
 			res.SelectFilter = test.Select
 
@@ -765,7 +785,7 @@ func TestRestorerConsistentTimestampsAndPermissions(t *testing.T) {
 		},
 	}, noopGetGenericAttributes)
 
-	res := NewRestorer(repo, sn, false, nil)
+	res := NewRestorer(repo, sn, Options{})
 
 	res.SelectFilter = func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
 		switch filepath.ToSlash(item) {
@@ -820,7 +840,7 @@ func TestVerifyCancel(t *testing.T) {
 	repo := repository.TestRepository(t)
 	sn, _ := saveSnapshot(t, repo, snapshot, noopGetGenericAttributes)
 
-	res := NewRestorer(repo, sn, false, nil)
+	res := NewRestorer(repo, sn, Options{})
 
 	tempdir := rtest.TempDir(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -862,7 +882,7 @@ func TestRestorerSparseFiles(t *testing.T) {
 		archiver.SnapshotOptions{})
 	rtest.OK(t, err)
 
-	res := NewRestorer(repo, sn, true, nil)
+	res := NewRestorer(repo, sn, Options{Sparse: true})
 
 	tempdir := rtest.TempDir(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -892,4 +912,257 @@ func TestRestorerSparseFiles(t *testing.T) {
 	// file system as well as the OS.
 	t.Logf("wrote %d zeros as %d blocks, %.1f%% sparse",
 		len(zeros), blocks, 100*sparsity)
+}
+
+func saveSnapshotsAndOverwrite(t *testing.T, baseSnapshot Snapshot, overwriteSnapshot Snapshot, options Options) string {
+	repo := repository.TestRepository(t)
+	tempdir := filepath.Join(rtest.TempDir(t), "target")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// base snapshot
+	sn, id := saveSnapshot(t, repo, baseSnapshot, noopGetGenericAttributes)
+	t.Logf("base snapshot saved as %v", id.Str())
+
+	res := NewRestorer(repo, sn, options)
+	rtest.OK(t, res.RestoreTo(ctx, tempdir))
+
+	// overwrite snapshot
+	sn, id = saveSnapshot(t, repo, overwriteSnapshot, noopGetGenericAttributes)
+	t.Logf("overwrite snapshot saved as %v", id.Str())
+	res = NewRestorer(repo, sn, options)
+	rtest.OK(t, res.RestoreTo(ctx, tempdir))
+
+	_, err := res.VerifyFiles(ctx, tempdir)
+	rtest.OK(t, err)
+
+	return tempdir
+}
+
+func TestRestorerSparseOverwrite(t *testing.T) {
+	baseSnapshot := Snapshot{
+		Nodes: map[string]Node{
+			"foo": File{Data: "content: new\n"},
+		},
+	}
+	var zero [14]byte
+	sparseSnapshot := Snapshot{
+		Nodes: map[string]Node{
+			"foo": File{Data: string(zero[:])},
+		},
+	}
+
+	saveSnapshotsAndOverwrite(t, baseSnapshot, sparseSnapshot, Options{Sparse: true, Overwrite: OverwriteAlways})
+}
+
+func TestRestorerOverwriteBehavior(t *testing.T) {
+	baseTime := time.Now()
+	baseSnapshot := Snapshot{
+		Nodes: map[string]Node{
+			"foo": File{Data: "content: foo\n", ModTime: baseTime},
+			"dirtest": Dir{
+				Nodes: map[string]Node{
+					"file": File{Data: "content: file\n", ModTime: baseTime},
+				},
+				ModTime: baseTime,
+			},
+		},
+	}
+	overwriteSnapshot := Snapshot{
+		Nodes: map[string]Node{
+			"foo": File{Data: "content: new\n", ModTime: baseTime.Add(time.Second)},
+			"dirtest": Dir{
+				Nodes: map[string]Node{
+					"file": File{Data: "content: file2\n", ModTime: baseTime.Add(-time.Second)},
+				},
+			},
+		},
+	}
+
+	var tests = []struct {
+		Overwrite OverwriteBehavior
+		Files     map[string]string
+	}{
+		{
+			Overwrite: OverwriteAlways,
+			Files: map[string]string{
+				"foo":          "content: new\n",
+				"dirtest/file": "content: file2\n",
+			},
+		},
+		{
+			Overwrite: OverwriteIfChanged,
+			Files: map[string]string{
+				"foo":          "content: new\n",
+				"dirtest/file": "content: file2\n",
+			},
+		},
+		{
+			Overwrite: OverwriteIfNewer,
+			Files: map[string]string{
+				"foo":          "content: new\n",
+				"dirtest/file": "content: file\n",
+			},
+		},
+		{
+			Overwrite: OverwriteNever,
+			Files: map[string]string{
+				"foo":          "content: foo\n",
+				"dirtest/file": "content: file\n",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run("", func(t *testing.T) {
+			tempdir := saveSnapshotsAndOverwrite(t, baseSnapshot, overwriteSnapshot, Options{Overwrite: test.Overwrite})
+
+			for filename, content := range test.Files {
+				data, err := os.ReadFile(filepath.Join(tempdir, filepath.FromSlash(filename)))
+				if err != nil {
+					t.Errorf("unable to read file %v: %v", filename, err)
+					continue
+				}
+
+				if !bytes.Equal(data, []byte(content)) {
+					t.Errorf("file %v has wrong content: want %q, got %q", filename, content, data)
+				}
+			}
+		})
+	}
+}
+
+func TestRestorerOverwriteSpecial(t *testing.T) {
+	baseTime := time.Now()
+	baseSnapshot := Snapshot{
+		Nodes: map[string]Node{
+			"dirtest":  Dir{ModTime: baseTime},
+			"link":     Symlink{Target: "foo", ModTime: baseTime},
+			"file":     File{Data: "content: file\n", Inode: 42, Links: 2, ModTime: baseTime},
+			"hardlink": File{Data: "content: file\n", Inode: 42, Links: 2, ModTime: baseTime},
+			"newdir":   File{Data: "content: dir\n", ModTime: baseTime},
+		},
+	}
+	overwriteSnapshot := Snapshot{
+		Nodes: map[string]Node{
+			"dirtest":  Symlink{Target: "foo", ModTime: baseTime},
+			"link":     File{Data: "content: link\n", Inode: 42, Links: 2, ModTime: baseTime.Add(time.Second)},
+			"file":     Symlink{Target: "foo2", ModTime: baseTime},
+			"hardlink": File{Data: "content: link\n", Inode: 42, Links: 2, ModTime: baseTime.Add(time.Second)},
+			"newdir":   Dir{ModTime: baseTime},
+		},
+	}
+
+	files := map[string]string{
+		"link":     "content: link\n",
+		"hardlink": "content: link\n",
+	}
+	links := map[string]string{
+		"dirtest": "foo",
+		"file":    "foo2",
+	}
+
+	tempdir := saveSnapshotsAndOverwrite(t, baseSnapshot, overwriteSnapshot, Options{Overwrite: OverwriteAlways})
+
+	for filename, content := range files {
+		data, err := os.ReadFile(filepath.Join(tempdir, filepath.FromSlash(filename)))
+		if err != nil {
+			t.Errorf("unable to read file %v: %v", filename, err)
+			continue
+		}
+
+		if !bytes.Equal(data, []byte(content)) {
+			t.Errorf("file %v has wrong content: want %q, got %q", filename, content, data)
+		}
+	}
+	for filename, target := range links {
+		link, err := fs.Readlink(filepath.Join(tempdir, filepath.FromSlash(filename)))
+		rtest.OK(t, err)
+		rtest.Equals(t, link, target, "wrong symlink target")
+	}
+}
+
+func TestRestoreModified(t *testing.T) {
+	// overwrite files between snapshots and also change their filesize
+	snapshots := []Snapshot{
+		{
+			Nodes: map[string]Node{
+				"foo": File{Data: "content: foo\n", ModTime: time.Now()},
+				"bar": File{Data: "content: a\n", ModTime: time.Now()},
+			},
+		},
+		{
+			Nodes: map[string]Node{
+				"foo": File{Data: "content: a\n", ModTime: time.Now()},
+				"bar": File{Data: "content: bar\n", ModTime: time.Now()},
+			},
+		},
+	}
+
+	repo := repository.TestRepository(t)
+	tempdir := filepath.Join(rtest.TempDir(t), "target")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for _, snapshot := range snapshots {
+		sn, id := saveSnapshot(t, repo, snapshot, noopGetGenericAttributes)
+		t.Logf("snapshot saved as %v", id.Str())
+
+		res := NewRestorer(repo, sn, Options{Overwrite: OverwriteIfChanged})
+		rtest.OK(t, res.RestoreTo(ctx, tempdir))
+		n, err := res.VerifyFiles(ctx, tempdir)
+		rtest.OK(t, err)
+		rtest.Equals(t, 2, n, "unexpected number of verified files")
+	}
+}
+
+func TestRestoreIfChanged(t *testing.T) {
+	origData := "content: foo\n"
+	modData := "content: bar\n"
+	rtest.Equals(t, len(modData), len(origData), "broken testcase")
+	snapshot := Snapshot{
+		Nodes: map[string]Node{
+			"foo": File{Data: origData, ModTime: time.Now()},
+		},
+	}
+
+	repo := repository.TestRepository(t)
+	tempdir := filepath.Join(rtest.TempDir(t), "target")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sn, id := saveSnapshot(t, repo, snapshot, noopGetGenericAttributes)
+	t.Logf("snapshot saved as %v", id.Str())
+
+	res := NewRestorer(repo, sn, Options{})
+	rtest.OK(t, res.RestoreTo(ctx, tempdir))
+
+	// modify file but maintain size and timestamp
+	path := filepath.Join(tempdir, "foo")
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	rtest.OK(t, err)
+	fi, err := f.Stat()
+	rtest.OK(t, err)
+	_, err = f.Write([]byte(modData))
+	rtest.OK(t, err)
+	rtest.OK(t, f.Close())
+	var utimes = [...]syscall.Timespec{
+		syscall.NsecToTimespec(fi.ModTime().UnixNano()),
+		syscall.NsecToTimespec(fi.ModTime().UnixNano()),
+	}
+	rtest.OK(t, syscall.UtimesNano(path, utimes[:]))
+
+	for _, overwrite := range []OverwriteBehavior{OverwriteIfChanged, OverwriteAlways} {
+		res = NewRestorer(repo, sn, Options{Overwrite: overwrite})
+		rtest.OK(t, res.RestoreTo(ctx, tempdir))
+		data, err := os.ReadFile(path)
+		rtest.OK(t, err)
+		if overwrite == OverwriteAlways {
+			// restore should notice the changed file content
+			rtest.Equals(t, origData, string(data), "expected original file content")
+		} else {
+			// restore should not have noticed the changed file content
+			rtest.Equals(t, modData, string(data), "expeced modified file content")
+		}
+	}
 }

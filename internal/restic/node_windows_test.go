@@ -4,17 +4,75 @@
 package restic
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/fs"
 	"github.com/restic/restic/internal/test"
 	"golang.org/x/sys/windows"
 )
+
+func TestRestoreSecurityDescriptors(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	for i, sd := range fs.TestFileSDs {
+		testRestoreSecurityDescriptor(t, sd, tempDir, "file", fmt.Sprintf("testfile%d", i))
+	}
+	for i, sd := range fs.TestDirSDs {
+		testRestoreSecurityDescriptor(t, sd, tempDir, "dir", fmt.Sprintf("testdir%d", i))
+	}
+}
+
+func testRestoreSecurityDescriptor(t *testing.T, sd string, tempDir, fileType, fileName string) {
+	// Decode the encoded string SD to get the security descriptor input in bytes.
+	sdInputBytes, err := base64.StdEncoding.DecodeString(sd)
+	test.OK(t, errors.Wrapf(err, "Error decoding SD for: %s", fileName))
+	// Wrap the security descriptor bytes in windows attributes and convert to generic attributes.
+	genericAttributes, err := WindowsAttrsToGenericAttributes(WindowsAttributes{CreationTime: nil, FileAttributes: nil, SecurityDescriptor: &sdInputBytes})
+	test.OK(t, errors.Wrapf(err, "Error constructing windows attributes for: %s", fileName))
+	// Construct a Node with the generic attributes.
+	expectedNode := getNode(fileName, fileType, genericAttributes)
+
+	// Restore the file/dir and restore the meta data including the security descriptors.
+	testPath, node := restoreAndGetNode(t, tempDir, expectedNode, false)
+	// Get the security descriptor from the node constructed from the file info of the restored path.
+	sdByteFromRestoredNode := getWindowsAttr(t, testPath, node).SecurityDescriptor
+
+	// Get the security descriptor for the test path after the restore.
+	sdBytesFromRestoredPath, err := fs.GetSecurityDescriptor(testPath)
+	test.OK(t, errors.Wrapf(err, "Error while getting the security descriptor for: %s", testPath))
+
+	// Compare the input SD and the SD got from the restored file.
+	fs.CompareSecurityDescriptors(t, testPath, sdInputBytes, *sdBytesFromRestoredPath)
+	// Compare the SD got from node constructed from the restored file info and the SD got directly from the restored file.
+	fs.CompareSecurityDescriptors(t, testPath, *sdByteFromRestoredNode, *sdBytesFromRestoredPath)
+}
+
+func getNode(name string, fileType string, genericAttributes map[GenericAttributeType]json.RawMessage) Node {
+	return Node{
+		Name:              name,
+		Type:              fileType,
+		Mode:              0644,
+		ModTime:           parseTime("2024-02-21 6:30:01.111"),
+		AccessTime:        parseTime("2024-02-22 7:31:02.222"),
+		ChangeTime:        parseTime("2024-02-23 8:32:03.333"),
+		GenericAttributes: genericAttributes,
+	}
+}
+
+func getWindowsAttr(t *testing.T, testPath string, node *Node) WindowsAttributes {
+	windowsAttributes, unknownAttribs, err := genericAttributesToWindowsAttrs(node.GenericAttributes)
+	test.OK(t, errors.Wrapf(err, "Error getting windows attr from generic attr: %s", testPath))
+	test.Assert(t, len(unknownAttribs) == 0, "Unkown attribs found: %s for: %s", unknownAttribs, testPath)
+	return windowsAttributes
+}
 
 func TestRestoreCreationTime(t *testing.T) {
 	t.Parallel()
@@ -165,7 +223,7 @@ func restoreAndGetNode(t *testing.T, tempDir string, testNode Node, warningExpec
 	fi, err := os.Lstat(testPath)
 	test.OK(t, errors.Wrapf(err, "Could not Lstat for path: %s", testPath))
 
-	nodeFromFileInfo, err := NodeFromFileInfo(testPath, fi)
+	nodeFromFileInfo, err := NodeFromFileInfo(testPath, fi, false)
 	test.OK(t, errors.Wrapf(err, "Could not get NodeFromFileInfo for path: %s", testPath))
 
 	return testPath, nodeFromFileInfo
@@ -206,5 +264,68 @@ func TestNewGenericAttributeType(t *testing.T) {
 		test.OK(t, err)
 		// Since this GenericAttribute is unknown to this version of the software, it will not get set on the file.
 		test.Assert(t, len(ua) == 0, "Unkown attributes: %s found for path: %s", ua, testPath)
+	}
+}
+
+func TestRestoreExtendedAttributes(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+	expectedNodes := []Node{
+		{
+			Name:       "testfile",
+			Type:       "file",
+			Mode:       0644,
+			ModTime:    parseTime("2005-05-14 21:07:03.111"),
+			AccessTime: parseTime("2005-05-14 21:07:04.222"),
+			ChangeTime: parseTime("2005-05-14 21:07:05.333"),
+			ExtendedAttributes: []ExtendedAttribute{
+				{"user.foo", []byte("bar")},
+			},
+		},
+		{
+			Name:       "testdirectory",
+			Type:       "dir",
+			Mode:       0755,
+			ModTime:    parseTime("2005-05-14 21:07:03.111"),
+			AccessTime: parseTime("2005-05-14 21:07:04.222"),
+			ChangeTime: parseTime("2005-05-14 21:07:05.333"),
+			ExtendedAttributes: []ExtendedAttribute{
+				{"user.foo", []byte("bar")},
+			},
+		},
+	}
+	for _, testNode := range expectedNodes {
+		testPath, node := restoreAndGetNode(t, tempDir, testNode, false)
+
+		var handle windows.Handle
+		var err error
+		utf16Path := windows.StringToUTF16Ptr(testPath)
+		if node.Type == "file" {
+			handle, err = windows.CreateFile(utf16Path, windows.FILE_READ_EA, 0, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		} else if node.Type == "dir" {
+			handle, err = windows.CreateFile(utf16Path, windows.FILE_READ_EA, 0, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+		}
+		test.OK(t, errors.Wrapf(err, "Error opening file/directory for: %s", testPath))
+		defer func() {
+			err := windows.Close(handle)
+			test.OK(t, errors.Wrapf(err, "Error closing file for: %s", testPath))
+		}()
+
+		extAttr, err := fs.GetFileEA(handle)
+		test.OK(t, errors.Wrapf(err, "Error getting extended attributes for: %s", testPath))
+		test.Equals(t, len(node.ExtendedAttributes), len(extAttr))
+
+		for _, expectedExtAttr := range node.ExtendedAttributes {
+			var foundExtAttr *fs.ExtendedAttribute
+			for _, ea := range extAttr {
+				if strings.EqualFold(ea.Name, expectedExtAttr.Name) {
+					foundExtAttr = &ea
+					break
+
+				}
+			}
+			test.Assert(t, foundExtAttr != nil, "Expected extended attribute not found")
+			test.Equals(t, expectedExtAttr.Value, foundExtAttr.Value)
+		}
 	}
 }

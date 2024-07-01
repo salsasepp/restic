@@ -12,12 +12,13 @@ import (
 	"strings"
 
 	"cloud.google.com/go/storage"
-	"github.com/pkg/errors"
+
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/backend/layout"
 	"github.com/restic/restic/internal/backend/location"
 	"github.com/restic/restic/internal/backend/util"
 	"github.com/restic/restic/internal/debug"
+	"github.com/restic/restic/internal/errors"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -134,7 +135,7 @@ func Open(_ context.Context, cfg Config, rt http.RoundTripper) (backend.Backend,
 func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (backend.Backend, error) {
 	be, err := open(cfg, rt)
 	if err != nil {
-		return nil, errors.Wrap(err, "open")
+		return nil, err
 	}
 
 	// Try to determine if the bucket exists. If it does not, try to create it.
@@ -145,7 +146,7 @@ func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (backend.Back
 			// however, the client doesn't have storage.bucket.get permission
 			return be, nil
 		}
-		return nil, errors.Wrap(err, "service.Buckets.Get")
+		return nil, errors.WithStack(err)
 	}
 
 	if !exists {
@@ -155,7 +156,7 @@ func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (backend.Back
 		// Bucket doesn't exist, try to create it.
 		if err := be.bucket.Create(ctx, be.projectID, bucketAttrs); err != nil {
 			// Always an error, as the bucket definitely doesn't exist.
-			return nil, errors.Wrap(err, "service.Buckets.Insert")
+			return nil, errors.WithStack(err)
 		}
 
 	}
@@ -173,6 +174,21 @@ func (be *Backend) IsNotExist(err error) bool {
 	return errors.Is(err, storage.ErrObjectNotExist)
 }
 
+func (be *Backend) IsPermanentError(err error) bool {
+	if be.IsNotExist(err) {
+		return true
+	}
+
+	var gerr *googleapi.Error
+	if errors.As(err, &gerr) {
+		if gerr.Code == http.StatusRequestedRangeNotSatisfiable || gerr.Code == http.StatusUnauthorized || gerr.Code == http.StatusForbidden {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Join combines path components with slashes.
 func (be *Backend) Join(p ...string) string {
 	return path.Join(p...)
@@ -180,11 +196,6 @@ func (be *Backend) Join(p ...string) string {
 
 func (be *Backend) Connections() uint {
 	return be.connections
-}
-
-// Location returns this backend's location (the bucket name).
-func (be *Backend) Location() string {
-	return be.Join(be.bucketName, be.prefix)
 }
 
 // Hasher may return a hash function for calculating a content hash for the backend
@@ -241,7 +252,7 @@ func (be *Backend) Save(ctx context.Context, h backend.Handle, rd backend.Rewind
 	}
 
 	if err != nil {
-		return errors.Wrap(err, "service.Objects.Insert")
+		return errors.WithStack(err)
 	}
 
 	// sanity check
@@ -273,6 +284,11 @@ func (be *Backend) openReader(ctx context.Context, h backend.Handle, length int,
 		return nil, err
 	}
 
+	if length > 0 && r.Attrs.Size < offset+int64(length) {
+		_ = r.Close()
+		return nil, &googleapi.Error{Code: http.StatusRequestedRangeNotSatisfiable, Message: "restic-file-too-short"}
+	}
+
 	return r, err
 }
 
@@ -283,7 +299,7 @@ func (be *Backend) Stat(ctx context.Context, h backend.Handle) (bi backend.FileI
 	attr, err := be.bucket.Object(objName).Attrs(ctx)
 
 	if err != nil {
-		return backend.FileInfo{}, errors.Wrap(err, "service.Objects.Get")
+		return backend.FileInfo{}, errors.WithStack(err)
 	}
 
 	return backend.FileInfo{Size: attr.Size, Name: h.Name}, nil
@@ -299,7 +315,7 @@ func (be *Backend) Remove(ctx context.Context, h backend.Handle) error {
 		err = nil
 	}
 
-	return errors.Wrap(err, "client.RemoveObject")
+	return errors.WithStack(err)
 }
 
 // List runs fn for each file in the backend which has the type t. When an

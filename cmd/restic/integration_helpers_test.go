@@ -252,11 +252,11 @@ func listTreePacks(gopts GlobalOptions, t *testing.T) restic.IDSet {
 
 	rtest.OK(t, r.LoadIndex(ctx, nil))
 	treePacks := restic.NewIDSet()
-	r.Index().Each(ctx, func(pb restic.PackedBlob) {
+	rtest.OK(t, r.ListBlobs(ctx, func(pb restic.PackedBlob) {
 		if pb.Type == restic.TreeBlob {
 			treePacks.Insert(pb.PackID)
 		}
-	})
+	}))
 
 	return treePacks
 }
@@ -267,7 +267,7 @@ func removePacks(gopts GlobalOptions, t testing.TB, remove restic.IDSet) {
 	defer unlock()
 
 	for id := range remove {
-		rtest.OK(t, r.Backend().Remove(ctx, backend.Handle{Type: restic.PackFile, Name: id.String()}))
+		rtest.OK(t, r.RemoveUnpacked(ctx, restic.PackFile, id))
 	}
 }
 
@@ -280,18 +280,18 @@ func removePacksExcept(gopts GlobalOptions, t testing.TB, keep restic.IDSet, rem
 	rtest.OK(t, r.LoadIndex(ctx, nil))
 
 	treePacks := restic.NewIDSet()
-	r.Index().Each(ctx, func(pb restic.PackedBlob) {
+	rtest.OK(t, r.ListBlobs(ctx, func(pb restic.PackedBlob) {
 		if pb.Type == restic.TreeBlob {
 			treePacks.Insert(pb.PackID)
 		}
-	})
+	}))
 
 	// remove all packs containing data blobs
 	rtest.OK(t, r.List(ctx, restic.PackFile, func(id restic.ID, size int64) error {
 		if treePacks.Has(id) != removeTreePacks || keep.Has(id) {
 			return nil
 		}
-		return r.Backend().Remove(ctx, backend.Handle{Type: restic.PackFile, Name: id.String()})
+		return r.RemoveUnpacked(ctx, restic.PackFile, id)
 	}))
 }
 

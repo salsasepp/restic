@@ -36,7 +36,7 @@ func prepareTempdirRepoSrc(t testing.TB, src TestDir) (string, restic.Repository
 	return tempdir, repo
 }
 
-func saveFile(t testing.TB, repo restic.Repository, filename string, filesystem fs.FS) (*restic.Node, ItemStats) {
+func saveFile(t testing.TB, repo archiverRepo, filename string, filesystem fs.FS) (*restic.Node, ItemStats) {
 	wg, ctx := errgroup.WithContext(context.TODO())
 	repo.StartPackUploader(ctx, wg)
 
@@ -416,14 +416,14 @@ func BenchmarkArchiverSaveFileLarge(b *testing.B) {
 }
 
 type blobCountingRepo struct {
-	restic.Repository
+	archiverRepo
 
 	m     sync.Mutex
 	saved map[restic.BlobHandle]uint
 }
 
 func (repo *blobCountingRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []byte, id restic.ID, storeDuplicate bool) (restic.ID, bool, int, error) {
-	id, exists, size, err := repo.Repository.SaveBlob(ctx, t, buf, id, storeDuplicate)
+	id, exists, size, err := repo.archiverRepo.SaveBlob(ctx, t, buf, id, storeDuplicate)
 	if exists {
 		return id, exists, size, err
 	}
@@ -435,7 +435,7 @@ func (repo *blobCountingRepo) SaveBlob(ctx context.Context, t restic.BlobType, b
 }
 
 func (repo *blobCountingRepo) SaveTree(ctx context.Context, t *restic.Tree) (restic.ID, error) {
-	id, err := restic.SaveTree(ctx, repo.Repository, t)
+	id, err := restic.SaveTree(ctx, repo.archiverRepo, t)
 	h := restic.BlobHandle{ID: id, Type: restic.TreeBlob}
 	repo.m.Lock()
 	repo.saved[h]++
@@ -465,8 +465,8 @@ func TestArchiverSaveFileIncremental(t *testing.T) {
 	tempdir := rtest.TempDir(t)
 
 	repo := &blobCountingRepo{
-		Repository: repository.TestRepository(t),
-		saved:      make(map[restic.BlobHandle]uint),
+		archiverRepo: repository.TestRepository(t),
+		saved:        make(map[restic.BlobHandle]uint),
 	}
 
 	data := rtest.Random(23, 512*1024+887898)
@@ -556,7 +556,7 @@ func rename(t testing.TB, oldname, newname string) {
 }
 
 func nodeFromFI(t testing.TB, filename string, fi os.FileInfo) *restic.Node {
-	node, err := restic.NodeFromFileInfo(filename, fi)
+	node, err := restic.NodeFromFileInfo(filename, fi, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -902,8 +902,8 @@ func TestArchiverSaveDirIncremental(t *testing.T) {
 	tempdir := rtest.TempDir(t)
 
 	repo := &blobCountingRepo{
-		Repository: repository.TestRepository(t),
-		saved:      make(map[restic.BlobHandle]uint),
+		archiverRepo: repository.TestRepository(t),
+		saved:        make(map[restic.BlobHandle]uint),
 	}
 
 	appendToFile(t, filepath.Join(tempdir, "testfile"), []byte("foobar"))
@@ -1430,7 +1430,7 @@ func TestArchiverSnapshot(t *testing.T) {
 			}
 			TestEnsureSnapshot(t, repo, snapshotID, want)
 
-			checker.TestCheckRepo(t, repo)
+			checker.TestCheckRepo(t, repo, false)
 
 			// check that the snapshot contains the targets with absolute paths
 			for i, target := range sn.Paths {
@@ -1590,7 +1590,7 @@ func TestArchiverSnapshotSelect(t *testing.T) {
 			}
 			TestEnsureSnapshot(t, repo, snapshotID, want)
 
-			checker.TestCheckRepo(t, repo)
+			checker.TestCheckRepo(t, repo, false)
 		})
 	}
 }
@@ -1794,7 +1794,7 @@ func TestArchiverParent(t *testing.T) {
 			t.Logf("second backup saved as %v", secondSnapshotID.Str())
 			t.Logf("testfs: %v", testFS)
 
-			checker.TestCheckRepo(t, repo)
+			checker.TestCheckRepo(t, repo, false)
 		})
 	}
 }
@@ -1927,7 +1927,7 @@ func TestArchiverErrorReporting(t *testing.T) {
 			}
 			TestEnsureSnapshot(t, repo, snapshotID, want)
 
-			checker.TestCheckRepo(t, repo)
+			checker.TestCheckRepo(t, repo, false)
 		})
 	}
 }
@@ -1970,7 +1970,7 @@ func TestArchiverContextCanceled(t *testing.T) {
 	})
 
 	// Ensure that the archiver itself reports the canceled context and not just the backend
-	repo := repository.TestRepositoryWithBackend(t, &noCancelBackend{mem.New()}, 0, repository.Options{})
+	repo, _ := repository.TestRepositoryWithBackend(t, &noCancelBackend{mem.New()}, 0, repository.Options{})
 
 	back := rtest.Chdir(t, tempdir)
 	defer back()
@@ -2017,7 +2017,7 @@ func (m *TrackFS) OpenFile(name string, flag int, perm os.FileMode) (fs.File, er
 }
 
 type failSaveRepo struct {
-	restic.Repository
+	archiverRepo
 	failAfter int32
 	cnt       int32
 	err       error
@@ -2029,7 +2029,7 @@ func (f *failSaveRepo) SaveBlob(ctx context.Context, t restic.BlobType, buf []by
 		return restic.Hash(buf), false, 0, f.err
 	}
 
-	return f.Repository.SaveBlob(ctx, t, buf, id, storeDuplicate)
+	return f.archiverRepo.SaveBlob(ctx, t, buf, id, storeDuplicate)
 }
 
 func TestArchiverAbortEarlyOnError(t *testing.T) {
@@ -2105,9 +2105,9 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 			}
 
 			testRepo := &failSaveRepo{
-				Repository: repo,
-				failAfter:  int32(test.failAfter),
-				err:        test.err,
+				archiverRepo: repo,
+				failAfter:    int32(test.failAfter),
+				err:          test.err,
 			}
 
 			// at most two files may be queued
@@ -2134,7 +2134,7 @@ func TestArchiverAbortEarlyOnError(t *testing.T) {
 	}
 }
 
-func snapshot(t testing.TB, repo restic.Repository, fs fs.FS, parent *restic.Snapshot, filename string) (*restic.Snapshot, *restic.Node) {
+func snapshot(t testing.TB, repo archiverRepo, fs fs.FS, parent *restic.Snapshot, filename string) (*restic.Snapshot, *restic.Node) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -2230,7 +2230,7 @@ func TestMetadataChanged(t *testing.T) {
 
 	// get metadata
 	fi := lstat(t, "testfile")
-	want, err := restic.NodeFromFileInfo("testfile", fi)
+	want, err := restic.NodeFromFileInfo("testfile", fi, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2288,7 +2288,7 @@ func TestMetadataChanged(t *testing.T) {
 	// make sure the content matches
 	TestEnsureFileContent(context.Background(), t, repo, "testfile", node3, files["testfile"].(TestFile))
 
-	checker.TestCheckRepo(t, repo)
+	checker.TestCheckRepo(t, repo, false)
 }
 
 func TestRacyFileSwap(t *testing.T) {

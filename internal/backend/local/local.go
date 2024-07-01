@@ -2,6 +2,7 @@ package local
 
 import (
 	"context"
+	"fmt"
 	"hash"
 	"io"
 	"os"
@@ -29,6 +30,8 @@ type Local struct {
 
 // ensure statically that *Local implements backend.Backend.
 var _ backend.Backend = &Local{}
+
+var errTooShort = fmt.Errorf("file is too short")
 
 func NewFactory() location.Factory {
 	return location.NewLimitedBackendFactory("local", ParseConfig, location.NoPassword, limiter.WrapBackendConstructor(Create), limiter.WrapBackendConstructor(Open))
@@ -90,11 +93,6 @@ func (b *Local) Connections() uint {
 	return b.Config.Connections
 }
 
-// Location returns this backend's location (the directory name).
-func (b *Local) Location() string {
-	return b.Path
-}
-
 // Hasher may return a hash function for calculating a content hash for the backend
 func (b *Local) Hasher() hash.Hash {
 	return nil
@@ -108,6 +106,10 @@ func (b *Local) HasAtomicReplace() bool {
 // IsNotExist returns true if the error is caused by a non existing file.
 func (b *Local) IsNotExist(err error) bool {
 	return errors.Is(err, os.ErrNotExist)
+}
+
+func (b *Local) IsPermanentError(err error) bool {
+	return b.IsNotExist(err) || errors.Is(err, errTooShort) || errors.Is(err, os.ErrPermission)
 }
 
 // Save stores data in the backend at the handle.
@@ -219,6 +221,18 @@ func (b *Local) openReader(_ context.Context, h backend.Handle, length int, offs
 		return nil, err
 	}
 
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	size := fi.Size()
+	if size < offset+int64(length) {
+		_ = f.Close()
+		return nil, errTooShort
+	}
+
 	if offset > 0 {
 		_, err = f.Seek(offset, 0)
 		if err != nil {
@@ -228,7 +242,7 @@ func (b *Local) openReader(_ context.Context, h backend.Handle, length int, offs
 	}
 
 	if length > 0 {
-		return backend.LimitReadCloser(f, int64(length)), nil
+		return util.LimitReadCloser(f, int64(length)), nil
 	}
 
 	return f, nil

@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strconv"
 
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/ui/termstatus"
 	"github.com/spf13/cobra"
 )
 
@@ -18,6 +21,9 @@ var cmdForget = &cobra.Command{
 The "forget" command removes snapshots according to a policy. All snapshots are
 first divided into groups according to "--group-by", and after that the policy
 specified by the "--keep-*" options is applied to each group individually.
+If there are not enough snapshots to keep one for each duration related
+"--keep-{within-,}*" option, the oldest snapshot in the group is kept
+additionally.
 
 Please note that this command really only deletes the snapshot object in the
 repository, which is a reference to data stored there. In order to remove the
@@ -33,7 +39,9 @@ Exit status is 0 if the command was successful, and non-zero if there was any er
 `,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runForget(cmd.Context(), forgetOptions, forgetPruneOptions, globalOptions, args)
+		term, cancel := setupTermstatus()
+		defer cancel()
+		return runForget(cmd.Context(), forgetOptions, forgetPruneOptions, globalOptions, term, args)
 	},
 }
 
@@ -88,6 +96,8 @@ type ForgetOptions struct {
 	WithinYearly  restic.Duration
 	KeepTags      restic.TagLists
 
+	UnsafeAllowRemoveAll bool
+
 	restic.SnapshotFilter
 	Compact bool
 
@@ -117,6 +127,7 @@ func init() {
 	f.VarP(&forgetOptions.WithinMonthly, "keep-within-monthly", "", "keep monthly snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
 	f.VarP(&forgetOptions.WithinYearly, "keep-within-yearly", "", "keep yearly snapshots that are newer than `duration` (eg. 1y5m7d2h) relative to the latest snapshot")
 	f.Var(&forgetOptions.KeepTags, "keep-tag", "keep snapshots with this `taglist` (can be specified multiple times)")
+	f.BoolVar(&forgetOptions.UnsafeAllowRemoveAll, "unsafe-allow-remove-all", false, "allow deleting all snapshots of a snapshot group")
 
 	initMultiSnapshotFilter(f, &forgetOptions.SnapshotFilter, false)
 	f.StringArrayVar(&forgetOptions.Hosts, "hostname", nil, "only consider snapshots with the given `hostname` (can be specified multiple times)")
@@ -152,7 +163,7 @@ func verifyForgetOptions(opts *ForgetOptions) error {
 	return nil
 }
 
-func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOptions, gopts GlobalOptions, args []string) error {
+func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOptions, gopts GlobalOptions, term *termstatus.Terminal, args []string) error {
 	err := verifyForgetOptions(&opts)
 	if err != nil {
 		return err
@@ -173,11 +184,20 @@ func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOption
 	}
 	defer unlock()
 
+	verbosity := gopts.verbosity
+	if gopts.JSON {
+		verbosity = 0
+	}
+	printer := newTerminalProgressPrinter(verbosity, term)
+
 	var snapshots restic.Snapshots
 	removeSnIDs := restic.NewIDSet()
 
 	for sn := range FindFilteredSnapshots(ctx, repo, repo, &opts.SnapshotFilter, args) {
 		snapshots = append(snapshots, sn)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	var jsonGroups []*ForgetGroup
@@ -209,72 +229,87 @@ func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOption
 			Tags:          opts.KeepTags,
 		}
 
-		if policy.Empty() && len(args) == 0 {
-			if !gopts.JSON {
-				Verbosef("no policy was specified, no snapshots will be removed\n")
+		if policy.Empty() {
+			if opts.UnsafeAllowRemoveAll {
+				if opts.SnapshotFilter.Empty() {
+					return errors.Fatal("--unsafe-allow-remove-all is not allowed unless a snapshot filter option is specified")
+				}
+				// UnsafeAllowRemoveAll together with snapshot filter is fine
+			} else {
+				return errors.Fatal("no policy was specified, no snapshots will be removed")
 			}
 		}
 
-		if !policy.Empty() {
-			if !gopts.JSON {
-				Verbosef("Applying Policy: %v\n", policy)
-			}
+		printer.P("Applying Policy: %v\n", policy)
 
-			for k, snapshotGroup := range snapshotGroups {
-				if gopts.Verbose >= 1 && !gopts.JSON {
-					err = PrintSnapshotGroupHeader(globalOptions.stdout, k)
-					if err != nil {
-						return err
-					}
-				}
-
-				var key restic.SnapshotGroupKey
-				if json.Unmarshal([]byte(k), &key) != nil {
+		for k, snapshotGroup := range snapshotGroups {
+			if gopts.Verbose >= 1 && !gopts.JSON {
+				err = PrintSnapshotGroupHeader(globalOptions.stdout, k)
+				if err != nil {
 					return err
 				}
+			}
 
-				var fg ForgetGroup
-				fg.Tags = key.Tags
-				fg.Host = key.Hostname
-				fg.Paths = key.Paths
+			var key restic.SnapshotGroupKey
+			if json.Unmarshal([]byte(k), &key) != nil {
+				return err
+			}
 
-				keep, remove, reasons := restic.ApplyPolicy(snapshotGroup, policy)
+			var fg ForgetGroup
+			fg.Tags = key.Tags
+			fg.Host = key.Hostname
+			fg.Paths = key.Paths
 
-				if len(keep) != 0 && !gopts.Quiet && !gopts.JSON {
-					Printf("keep %d snapshots:\n", len(keep))
-					PrintSnapshots(globalOptions.stdout, keep, reasons, opts.Compact)
-					Printf("\n")
-				}
-				fg.Keep = asJSONSnapshots(keep)
+			keep, remove, reasons := restic.ApplyPolicy(snapshotGroup, policy)
 
-				if len(remove) != 0 && !gopts.Quiet && !gopts.JSON {
-					Printf("remove %d snapshots:\n", len(remove))
-					PrintSnapshots(globalOptions.stdout, remove, nil, opts.Compact)
-					Printf("\n")
-				}
-				fg.Remove = asJSONSnapshots(remove)
+			if feature.Flag.Enabled(feature.SafeForgetKeepTags) && !policy.Empty() && len(keep) == 0 {
+				return fmt.Errorf("refusing to delete last snapshot of snapshot group \"%v\"", key.String())
+			}
+			if len(keep) != 0 && !gopts.Quiet && !gopts.JSON {
+				printer.P("keep %d snapshots:\n", len(keep))
+				PrintSnapshots(globalOptions.stdout, keep, reasons, opts.Compact)
+				printer.P("\n")
+			}
+			fg.Keep = asJSONSnapshots(keep)
 
-				fg.Reasons = asJSONKeeps(reasons)
+			if len(remove) != 0 && !gopts.Quiet && !gopts.JSON {
+				printer.P("remove %d snapshots:\n", len(remove))
+				PrintSnapshots(globalOptions.stdout, remove, nil, opts.Compact)
+				printer.P("\n")
+			}
+			fg.Remove = asJSONSnapshots(remove)
 
-				jsonGroups = append(jsonGroups, &fg)
+			fg.Reasons = asJSONKeeps(reasons)
 
-				for _, sn := range remove {
-					removeSnIDs.Insert(*sn.ID())
-				}
+			jsonGroups = append(jsonGroups, &fg)
+
+			for _, sn := range remove {
+				removeSnIDs.Insert(*sn.ID())
 			}
 		}
 	}
 
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	if len(removeSnIDs) > 0 {
 		if !opts.DryRun {
-			err := DeleteFilesChecked(ctx, gopts, repo, removeSnIDs, restic.SnapshotFile)
+			bar := printer.NewCounter("files deleted")
+			err := restic.ParallelRemove(ctx, repo, removeSnIDs, restic.SnapshotFile, func(id restic.ID, err error) error {
+				if err != nil {
+					printer.E("unable to remove %v/%v from the repository\n", restic.SnapshotFile, id)
+				} else {
+					printer.VV("removed %v/%v\n", restic.SnapshotFile, id)
+				}
+				return nil
+			}, bar)
+			bar.Done()
 			if err != nil {
 				return err
 			}
 		} else {
-			if !gopts.JSON {
-				Printf("Would have removed the following snapshots:\n%v\n\n", removeSnIDs)
-			}
+			printer.P("Would have removed the following snapshots:\n%v\n\n", removeSnIDs)
 		}
 	}
 
@@ -286,15 +321,13 @@ func runForget(ctx context.Context, opts ForgetOptions, pruneOptions PruneOption
 	}
 
 	if len(removeSnIDs) > 0 && opts.Prune {
-		if !gopts.JSON {
-			if opts.DryRun {
-				Verbosef("%d snapshots would be removed, running prune dry run\n", len(removeSnIDs))
-			} else {
-				Verbosef("%d snapshots have been removed, running prune\n", len(removeSnIDs))
-			}
+		if opts.DryRun {
+			printer.P("%d snapshots would be removed, running prune dry run\n", len(removeSnIDs))
+		} else {
+			printer.P("%d snapshots have been removed, running prune\n", len(removeSnIDs))
 		}
 		pruneOptions.DryRun = opts.DryRun
-		return runPruneWithRepo(ctx, pruneOptions, gopts, repo, removeSnIDs)
+		return runPruneWithRepo(ctx, pruneOptions, gopts, repo, removeSnIDs, term)
 	}
 
 	return nil

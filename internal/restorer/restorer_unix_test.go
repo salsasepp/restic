@@ -5,6 +5,7 @@ package restorer
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -31,7 +32,7 @@ func TestRestorerRestoreEmptyHardlinkedFileds(t *testing.T) {
 		},
 	}, noopGetGenericAttributes)
 
-	res := NewRestorer(repo, sn, false, nil)
+	res := NewRestorer(repo, sn, Options{})
 
 	res.SelectFilter = func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
 		return true, true
@@ -70,16 +71,13 @@ func getBlockCount(t *testing.T, filename string) int64 {
 }
 
 type printerMock struct {
-	filesFinished, filesTotal, allBytesWritten, allBytesTotal uint64
+	s restoreui.State
 }
 
-func (p *printerMock) Update(_, _, _, _ uint64, _ time.Duration) {
+func (p *printerMock) Update(_ restoreui.State, _ time.Duration) {
 }
-func (p *printerMock) Finish(filesFinished, filesTotal, allBytesWritten, allBytesTotal uint64, _ time.Duration) {
-	p.filesFinished = filesFinished
-	p.filesTotal = filesTotal
-	p.allBytesWritten = allBytesWritten
-	p.allBytesTotal = allBytesTotal
+func (p *printerMock) Finish(s restoreui.State, _ time.Duration) {
+	p.s = s
 }
 
 func TestRestorerProgressBar(t *testing.T) {
@@ -99,7 +97,7 @@ func TestRestorerProgressBar(t *testing.T) {
 
 	mock := &printerMock{}
 	progress := restoreui.NewProgress(mock, 0)
-	res := NewRestorer(repo, sn, false, progress)
+	res := NewRestorer(repo, sn, Options{Progress: progress})
 	res.SelectFilter = func(item string, dstpath string, node *restic.Node) (selectedForRestore bool, childMayBeSelected bool) {
 		return true, true
 	}
@@ -112,12 +110,43 @@ func TestRestorerProgressBar(t *testing.T) {
 	rtest.OK(t, err)
 	progress.Finish()
 
-	const filesFinished = 4
-	const filesTotal = filesFinished
-	const allBytesWritten = 10
-	const allBytesTotal = allBytesWritten
-	rtest.Assert(t, mock.filesFinished == filesFinished, "filesFinished: expected %v, got %v", filesFinished, mock.filesFinished)
-	rtest.Assert(t, mock.filesTotal == filesTotal, "filesTotal: expected %v, got %v", filesTotal, mock.filesTotal)
-	rtest.Assert(t, mock.allBytesWritten == allBytesWritten, "allBytesWritten: expected %v, got %v", allBytesWritten, mock.allBytesWritten)
-	rtest.Assert(t, mock.allBytesTotal == allBytesTotal, "allBytesTotal: expected %v, got %v", allBytesTotal, mock.allBytesTotal)
+	rtest.Equals(t, restoreui.State{
+		FilesFinished:   4,
+		FilesTotal:      4,
+		FilesSkipped:    0,
+		AllBytesWritten: 10,
+		AllBytesTotal:   10,
+		AllBytesSkipped: 0,
+	}, mock.s)
+}
+
+func TestRestorePermissions(t *testing.T) {
+	snapshot := Snapshot{
+		Nodes: map[string]Node{
+			"foo": File{Data: "content: foo\n", Mode: 0o600, ModTime: time.Now()},
+		},
+	}
+
+	repo := repository.TestRepository(t)
+	tempdir := filepath.Join(rtest.TempDir(t), "target")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sn, id := saveSnapshot(t, repo, snapshot, noopGetGenericAttributes)
+	t.Logf("snapshot saved as %v", id.Str())
+
+	res := NewRestorer(repo, sn, Options{})
+	rtest.OK(t, res.RestoreTo(ctx, tempdir))
+
+	for _, overwrite := range []OverwriteBehavior{OverwriteIfChanged, OverwriteAlways} {
+		// tamper with permissions
+		path := filepath.Join(tempdir, "foo")
+		rtest.OK(t, os.Chmod(path, 0o700))
+
+		res = NewRestorer(repo, sn, Options{Overwrite: overwrite})
+		rtest.OK(t, res.RestoreTo(ctx, tempdir))
+		fi, err := os.Stat(path)
+		rtest.OK(t, err)
+		rtest.Equals(t, fs.FileMode(0o600), fi.Mode().Perm(), "unexpected permissions")
+	}
 }

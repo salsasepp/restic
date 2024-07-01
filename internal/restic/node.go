@@ -48,13 +48,15 @@ const (
 	TypeCreationTime GenericAttributeType = "windows.creation_time"
 	// TypeFileAttributes is the GenericAttributeType used for storing file attributes for windows files within the generic attributes map.
 	TypeFileAttributes GenericAttributeType = "windows.file_attributes"
+	// TypeSecurityDescriptor is the GenericAttributeType used for storing security descriptors including owner, group, discretionary access control list (DACL), system access control list (SACL)) for windows files within the generic attributes map.
+	TypeSecurityDescriptor GenericAttributeType = "windows.security_descriptor"
 
 	// Generic Attributes for other OS types should be defined here.
 )
 
 // init is called when the package is initialized. Any new GenericAttributeTypes being created must be added here as well.
 func init() {
-	storeGenericAttributeType(TypeCreationTime, TypeFileAttributes)
+	storeGenericAttributeType(TypeCreationTime, TypeFileAttributes, TypeSecurityDescriptor)
 }
 
 // genericAttributesForOS maintains a map of known genericAttributesForOS to the OSType
@@ -134,7 +136,7 @@ func (node Node) String() string {
 
 // NodeFromFileInfo returns a new node from the given path and FileInfo. It
 // returns the first error that is encountered, together with a node.
-func NodeFromFileInfo(path string, fi os.FileInfo) (*Node, error) {
+func NodeFromFileInfo(path string, fi os.FileInfo, ignoreXattrListError bool) (*Node, error) {
 	mask := os.ModePerm | os.ModeType | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
 	node := &Node{
 		Path:    path,
@@ -148,7 +150,7 @@ func NodeFromFileInfo(path string, fi os.FileInfo) (*Node, error) {
 		node.Size = uint64(fi.Size())
 	}
 
-	err := node.fillExtra(path, fi)
+	err := node.fillExtra(path, fi, ignoreXattrListError)
 	return node, err
 }
 
@@ -282,16 +284,6 @@ func (node Node) restoreMetadata(path string, warn func(msg string)) error {
 	return firsterr
 }
 
-func (node Node) restoreExtendedAttributes(path string) error {
-	for _, attr := range node.ExtendedAttributes {
-		err := Setxattr(path, attr.Name, attr.Value)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (node Node) RestoreTimestamps(path string) error {
 	var utimes = [...]syscall.Timespec{
 		syscall.NsecToTimespec(node.AccessTime.UnixNano()),
@@ -356,11 +348,6 @@ func (node Node) writeNodeContent(ctx context.Context, repo BlobLoader, f *os.Fi
 }
 
 func (node Node) createSymlinkAt(path string) error {
-
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return errors.Wrap(err, "Symlink")
-	}
-
 	if err := fs.Symlink(node.LinkTarget, path); err != nil {
 		return errors.WithStack(err)
 	}
@@ -675,7 +662,7 @@ func lookupGroup(gid uint32) string {
 	return group
 }
 
-func (node *Node) fillExtra(path string, fi os.FileInfo) error {
+func (node *Node) fillExtra(path string, fi os.FileInfo, ignoreXattrListError bool) error {
 	stat, ok := toStatT(fi.Sys())
 	if !ok {
 		// fill minimal info with current values for uid, gid
@@ -719,39 +706,9 @@ func (node *Node) fillExtra(path string, fi os.FileInfo) error {
 	allowExtended, err := node.fillGenericAttributes(path, fi, stat)
 	if allowExtended {
 		// Skip processing ExtendedAttributes if allowExtended is false.
-		errEx := node.fillExtendedAttributes(path)
-		if err == nil {
-			err = errEx
-		} else {
-			debug.Log("Error filling extended attributes for %v at %v : %v", node.Name, path, errEx)
-		}
+		err = errors.CombineErrors(err, node.fillExtendedAttributes(path, ignoreXattrListError))
 	}
 	return err
-}
-
-func (node *Node) fillExtendedAttributes(path string) error {
-	xattrs, err := Listxattr(path)
-	debug.Log("fillExtendedAttributes(%v) %v %v", path, xattrs, err)
-	if err != nil {
-		return err
-	}
-
-	node.ExtendedAttributes = make([]ExtendedAttribute, 0, len(xattrs))
-	for _, attr := range xattrs {
-		attrVal, err := Getxattr(path, attr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "can not obtain extended attribute %v for %v:\n", attr, path)
-			continue
-		}
-		attr := ExtendedAttribute{
-			Name:  attr,
-			Value: attrVal,
-		}
-
-		node.ExtendedAttributes = append(node.ExtendedAttributes, attr)
-	}
-
-	return nil
 }
 
 func mkfifo(path string, mode uint32) (err error) {
